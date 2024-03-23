@@ -1,22 +1,24 @@
 /* eslint-disable sort-keys-fix/sort-keys-fix, typescript-sort-keys/interface */
-// Note: DON'T REMOVE THE FIRST LINE
 // Disable the auto sort key eslint rule to make the code more logic and readable
+import { copyToClipboard } from '@lobehub/ui';
 import { template } from 'lodash-es';
-import useSWR, { SWRResponse, mutate } from 'swr';
+import { SWRResponse, mutate } from 'swr';
 import { StateCreator } from 'zustand/vanilla';
 
-import { GPT4_VISION_MODEL_DEFAULT_MAX_TOKENS } from '@/const/llm';
 import { LOADING_FLAT, isFunctionMessageAtStart, testFunctionMessageAtEnd } from '@/const/message';
+import { TraceEventType, TraceNameMap } from '@/const/trace';
 import { CreateMessageParams } from '@/database/models/message';
+import { useClientDataSWR } from '@/libs/swr';
 import { chatService } from '@/services/chat';
 import { messageService } from '@/services/message';
 import { topicService } from '@/services/topic';
+import { traceService } from '@/services/trace';
 import { chatHelpers } from '@/store/chat/helpers';
 import { ChatStore } from '@/store/chat/store';
 import { useSessionStore } from '@/store/session';
 import { agentSelectors } from '@/store/session/selectors';
 import { ChatMessage } from '@/types/message';
-import { fetchSSE } from '@/utils/fetch';
+import { TraceEventPayloads } from '@/types/trace';
 import { setNamespace } from '@/utils/storeDebug';
 
 import { chatSelectors } from '../../selectors';
@@ -24,23 +26,43 @@ import { MessageDispatch, messagesReducer } from './reducer';
 
 const n = setNamespace('message');
 
+const SWR_USE_FETCH_MESSAGES = 'SWR_USE_FETCH_MESSAGES';
+
+interface SendMessageParams {
+  message: string;
+  files?: { id: string; url: string }[];
+  onlyAddUserMessage?: boolean;
+}
+
 export interface ChatMessageAction {
   // create
-  resendMessage: (id: string) => Promise<void>;
-  sendMessage: (text: string, images?: { id: string; url: string }[]) => Promise<void>;
+  sendMessage: (params: SendMessageParams) => Promise<void>;
+  /**
+   * regenerate message
+   * trace enabled
+   * @param id
+   */
+  regenerateMessage: (id: string) => Promise<void>;
+
   // delete
   /**
    * clear message on the active session
    */
   clearMessage: () => Promise<void>;
   deleteMessage: (id: string) => Promise<void>;
+  delAndRegenerateMessage: (id: string) => Promise<void>;
   clearAllMessages: () => Promise<void>;
   // update
   updateInputMessage: (message: string) => void;
-  updateMessageContent: (id: string, content: string) => Promise<void>;
+  modifyMessageContent: (id: string, content: string) => Promise<void>;
   // query
   useFetchMessages: (sessionId: string, topicId?: string) => SWRResponse<ChatMessage[]>;
   stopGenerateMessage: () => void;
+  copyMessage: (id: string, content: string) => Promise<void>;
+
+  // =========  ↓ Internal Method ↓  ========== //
+  // ========================================== //
+  // ========================================== //
 
   /**
    * update message at the frontend point
@@ -50,7 +72,11 @@ export interface ChatMessageAction {
   /**
    * core process of the AI message (include preprocess and postprocess)
    */
-  coreProcessMessage: (messages: ChatMessage[], parentId: string) => Promise<void>;
+  coreProcessMessage: (
+    messages: ChatMessage[],
+    parentId: string,
+    traceId?: string,
+  ) => Promise<void>;
   /**
    * 实际获取 AI 响应
    * @param messages - 聊天消息数组
@@ -59,11 +85,13 @@ export interface ChatMessageAction {
   fetchAIChatMessage: (
     messages: ChatMessage[],
     assistantMessageId: string,
+    traceId?: string,
   ) => Promise<{
     content: string;
     functionCallAtEnd: boolean;
     functionCallContent: string;
     isFunctionCall: boolean;
+    traceId?: string;
   }>;
   toggleChatLoading: (
     loading: boolean,
@@ -71,9 +99,30 @@ export interface ChatMessageAction {
     action?: string,
   ) => AbortController | undefined;
   refreshMessages: () => Promise<void>;
+  // TODO: 后续 smoothMessage 实现考虑落到 sse 这一层
+  createSmoothMessage: (id: string) => {
+    startAnimation: (speed?: number) => Promise<void>;
+    stopAnimation: () => void;
+    outputQueue: string[];
+    isAnimationActive: boolean;
+  };
+  /**
+   * a method used by other action
+   * @param id
+   * @param content
+   */
+  internalUpdateMessageContent: (id: string, content: string) => Promise<void>;
+  internalResendMessage: (id: string, traceId?: string) => Promise<void>;
+  internalTraceMessage: (id: string, payload: TraceEventPayloads) => Promise<void>;
 }
 
 const getAgentConfig = () => agentSelectors.currentAgentConfig(useSessionStore.getState());
+
+const preventLeavingFn = (e: BeforeUnloadEvent) => {
+  // set returnValue to trigger alert modal
+  // Note: No matter what value is set, the browser will display the standard text
+  e.returnValue = '你有正在生成中的请求，确定要离开吗？';
+};
 
 export const chatMessage: StateCreator<
   ChatStore,
@@ -84,6 +133,21 @@ export const chatMessage: StateCreator<
   deleteMessage: async (id) => {
     await messageService.removeMessage(id);
     await get().refreshMessages();
+  },
+  delAndRegenerateMessage: async (id) => {
+    const traceId = chatSelectors.getTraceIdByMessageId(id)(get());
+    get().internalResendMessage(id, traceId);
+    get().deleteMessage(id);
+
+    // trace the delete and regenerate message
+    get().internalTraceMessage(id, { eventType: TraceEventType.DeleteAndRegenerateMessage });
+  },
+  regenerateMessage: async (id: string) => {
+    const traceId = chatSelectors.getTraceIdByMessageId(id)(get());
+    await get().internalResendMessage(id, traceId);
+
+    // trace the delete and regenerate message
+    get().internalTraceMessage(id, { eventType: TraceEventType.RegenerateMessage });
   },
   clearMessage: async () => {
     const { activeId, activeTopicId, refreshMessages, refreshTopic, switchTopic } = get();
@@ -104,7 +168,7 @@ export const chatMessage: StateCreator<
     await messageService.clearAllMessage();
     await refreshMessages();
   },
-  resendMessage: async (messageId) => {
+  internalResendMessage: async (messageId, traceId) => {
     // 1. 构造所有相关的历史记录
     const chats = chatSelectors.currentChats(get());
 
@@ -139,9 +203,9 @@ export const chatMessage: StateCreator<
 
     if (!latestMsg) return;
 
-    await coreProcessMessage(contextMessages, latestMsg.id);
+    await coreProcessMessage(contextMessages, latestMsg.id, traceId);
   },
-  sendMessage: async (message, files) => {
+  sendMessage: async ({ message, files, onlyAddUserMessage }) => {
     const { coreProcessMessage, activeTopicId, activeId } = get();
     if (!activeId) return;
 
@@ -150,7 +214,7 @@ export const chatMessage: StateCreator<
     // if message is empty and no files, then stop
     if (!message && (!fileIdList || fileIdList?.length === 0)) return;
 
-    let newMessage: CreateMessageParams = {
+    const newMessage: CreateMessageParams = {
       content: message,
       // if message has attached with files, then add files to message and the agent
       files: fileIdList,
@@ -162,6 +226,9 @@ export const chatMessage: StateCreator<
 
     const id = await messageService.create(newMessage);
     await get().refreshMessages();
+
+    // if only add user message, then stop
+    if (onlyAddUserMessage) return;
 
     // Get the current messages to generate AI response
     const messages = chatSelectors.currentChats(get());
@@ -182,6 +249,12 @@ export const chatMessage: StateCreator<
     }
   },
 
+  copyMessage: async (id, content) => {
+    await copyToClipboard(content);
+
+    get().internalTraceMessage(id, { eventType: TraceEventType.CopyMessage });
+  },
+
   stopGenerateMessage: () => {
     const { abortController, toggleChatLoading } = get();
     if (!abortController) return;
@@ -193,21 +266,20 @@ export const chatMessage: StateCreator<
   updateInputMessage: (message) => {
     set({ inputMessage: message }, false, n('updateInputMessage', message));
   },
-  updateMessageContent: async (id, content) => {
-    const { dispatchMessage, refreshMessages } = get();
+  modifyMessageContent: async (id, content) => {
+    // tracing the diff of update
+    // due to message content will change, so we need send trace before update,or will get wrong data
+    get().internalTraceMessage(id, {
+      eventType: TraceEventType.ModifyMessage,
+      nextContent: content,
+    });
 
-    // Due to the async update method and refresh need about 100ms
-    // we need to update the message content at the frontend to avoid the update flick
-    // refs: https://medium.com/@kyledeguzmanx/what-are-optimistic-updates-483662c3e171
-    dispatchMessage({ id, key: 'content', type: 'updateMessage', value: content });
-
-    await messageService.updateMessage(id, { content });
-    await refreshMessages();
+    await get().internalUpdateMessageContent(id, content);
   },
   useFetchMessages: (sessionId, activeTopicId) =>
-    useSWR<ChatMessage[]>(
-      [sessionId, activeTopicId],
-      async ([sessionId, topicId]: [string, string | undefined]) =>
+    useClientDataSWR<ChatMessage[]>(
+      [SWR_USE_FETCH_MESSAGES, sessionId, activeTopicId],
+      async ([, sessionId, topicId]: [string, string, string | undefined]) =>
         messageService.getMessages(sessionId, topicId),
       {
         onSuccess: (messages, key) => {
@@ -220,27 +292,24 @@ export const chatMessage: StateCreator<
             }),
           );
         },
-        // default is 2000ms ,it makes the user's quick switch don't work correctly.
-        // Cause issue like this: https://github.com/lobehub/lobe-chat/issues/532
-        // we need to set it to 0.
-        dedupingInterval: 0,
       },
     ),
   refreshMessages: async () => {
-    await mutate([get().activeId, get().activeTopicId]);
+    await mutate([SWR_USE_FETCH_MESSAGES, get().activeId, get().activeTopicId]);
   },
 
   // the internal process method of the AI message
-  coreProcessMessage: async (messages, userMessageId) => {
+  coreProcessMessage: async (messages, userMessageId, trace) => {
     const { fetchAIChatMessage, triggerFunctionCall, refreshMessages, activeTopicId } = get();
 
-    const { model } = getAgentConfig();
+    const { model, provider } = getAgentConfig();
 
     // 1. Add an empty message to place the AI response
     const assistantMessage: CreateMessageParams = {
       role: 'assistant',
       content: LOADING_FLAT,
       fromModel: model,
+      fromProvider: provider,
 
       parentId: userMessageId,
       sessionId: get().activeId,
@@ -251,8 +320,8 @@ export const chatMessage: StateCreator<
     await refreshMessages();
 
     // 2. fetch the AI response
-    const { isFunctionCall, content, functionCallAtEnd, functionCallContent } =
-      await fetchAIChatMessage(messages, mid);
+    const { isFunctionCall, content, functionCallAtEnd, functionCallContent, traceId } =
+      await fetchAIChatMessage(messages, mid, trace);
 
     // 3. if it's the function call message, trigger the function method
     if (isFunctionCall) {
@@ -262,18 +331,20 @@ export const chatMessage: StateCreator<
       if (functionCallAtEnd) {
         // create a new separate message and remove the function call from the prev message
 
-        await get().updateMessageContent(mid, content.replace(functionCallContent, ''));
+        await get().internalUpdateMessageContent(mid, content.replace(functionCallContent, ''));
 
         const functionMessage: CreateMessageParams = {
           role: 'function',
           content: functionCallContent,
-          extra: {
-            fromModel: model,
-          },
+          fromModel: model,
+          fromProvider: provider,
+
           parentId: userMessageId,
           sessionId: get().activeId,
           topicId: activeTopicId,
+          traceId,
         };
+
         functionId = await messageService.create(functionMessage);
       }
 
@@ -290,8 +361,14 @@ export const chatMessage: StateCreator<
 
     set({ messages }, false, n(`dispatchMessage/${payload.type}`, payload));
   },
-  fetchAIChatMessage: async (messages, assistantId) => {
-    const { toggleChatLoading, refreshMessages, updateMessageContent } = get();
+  fetchAIChatMessage: async (messages, assistantId, traceId) => {
+    const {
+      toggleChatLoading,
+      refreshMessages,
+      internalUpdateMessageContent,
+      dispatchMessage,
+      createSmoothMessage,
+    } = get();
 
     const abortController = toggleChatLoading(
       true,
@@ -341,41 +418,82 @@ export const chatMessage: StateCreator<
     if (config.model === 'gpt-4-vision-preview') {
       /* eslint-disable unicorn/no-lonely-if */
       if (!config.params.max_tokens)
-        config.params.max_tokens = GPT4_VISION_MODEL_DEFAULT_MAX_TOKENS;
+        // refs: https://github.com/lobehub/lobe-chat/issues/837
+        config.params.max_tokens = 2048;
     }
-
-    const fetcher = () =>
-      chatService.createAssistantMessage(
-        {
-          messages: preprocessMsgs,
-          model: config.model,
-          ...config.params,
-          plugins: config.plugins,
-        },
-        { signal: abortController?.signal },
-      );
 
     let output = '';
     let isFunctionCall = false;
     let functionCallAtEnd = false;
     let functionCallContent = '';
+    let msgTraceId: string | undefined;
 
-    await fetchSSE(fetcher, {
+    const { startAnimation, stopAnimation, outputQueue, isAnimationActive } =
+      createSmoothMessage(assistantId);
+
+    await chatService.createAssistantMessageStream({
+      abortController,
+      params: {
+        messages: preprocessMsgs,
+        model: config.model,
+        provider: config.provider,
+        ...config.params,
+        plugins: config.plugins,
+      },
+      trace: {
+        traceId,
+        sessionId: get().activeId,
+        topicId: get().activeTopicId,
+        traceName: TraceNameMap.Conversation,
+      },
       onErrorHandle: async (error) => {
         await messageService.updateMessageError(assistantId, error);
         await refreshMessages();
       },
-      onFinish: async (content) => {
+      onAbort: async () => {
+        stopAnimation();
+      },
+      onFinish: async (content, { traceId, observationId }) => {
+        stopAnimation();
+        // if there is traceId, update it
+        if (traceId) {
+          msgTraceId = traceId;
+          await messageService.updateMessage(assistantId, {
+            traceId,
+            observationId: observationId ?? undefined,
+          });
+        }
+
+        // if there is still content not displayed,
+        // and the message is not a function call
+        // then continue the animation
+        if (outputQueue.length > 0 && !isFunctionCall) {
+          await startAnimation(15);
+        }
+
         // update the content after fetch result
-        await updateMessageContent(assistantId, content);
+        await internalUpdateMessageContent(assistantId, content);
       },
       onMessageHandle: async (text) => {
         output += text;
-
-        await updateMessageContent(assistantId, output);
+        outputQueue.push(...text.split(''));
 
         // is this message is just a function call
-        if (isFunctionMessageAtStart(output)) isFunctionCall = true;
+        if (isFunctionMessageAtStart(output)) {
+          stopAnimation();
+          dispatchMessage({
+            id: assistantId,
+            key: 'content',
+            type: 'updateMessage',
+            value: output,
+          });
+          isFunctionCall = true;
+        }
+
+        // if it's the first time to receive the message,
+        // and the message is not a function call
+        // then start the animation
+        if (!isAnimationActive && !isFunctionCall) startAnimation();
       },
     });
 
@@ -394,15 +512,117 @@ export const chatMessage: StateCreator<
       }
     }
 
-    return { content: output, functionCallAtEnd, functionCallContent, isFunctionCall };
+    return {
+      content: output,
+      functionCallAtEnd,
+      functionCallContent,
+      isFunctionCall,
+      traceId: msgTraceId,
+    };
   },
   toggleChatLoading: (loading, id, action) => {
     if (loading) {
+      window.addEventListener('beforeunload', preventLeavingFn);
+
       const abortController = new AbortController();
       set({ abortController, chatLoadingId: id }, false, action);
+
       return abortController;
     } else {
       set({ abortController: undefined, chatLoadingId: undefined }, false, action);
+
+      window.removeEventListener('beforeunload', preventLeavingFn);
+    }
+  },
+  internalUpdateMessageContent: async (id, content) => {
+    const { dispatchMessage, refreshMessages } = get();
+
+    // Due to the async update method and refresh need about 100ms
+    // we need to update the message content at the frontend to avoid the update flick
+    // refs: https://medium.com/@kyledeguzmanx/what-are-optimistic-updates-483662c3e171
+    dispatchMessage({ id, key: 'content', type: 'updateMessage', value: content });
+
+    await messageService.updateMessage(id, { content });
+    await refreshMessages();
+  },
+
+  createSmoothMessage: (id) => {
+    const { dispatchMessage } = get();
+
+    let buffer = '';
+    // why use queue: https://shareg.pt/GLBrjpK
+    let outputQueue: string[] = [];
+
+    // eslint-disable-next-line no-undef
+    let animationTimeoutId: NodeJS.Timeout | null = null;
+    let isAnimationActive = false;
+
+    // when you need to stop the animation, call this function
+    const stopAnimation = () => {
+      isAnimationActive = false;
+      if (animationTimeoutId !== null) {
+        clearTimeout(animationTimeoutId);
+        animationTimeoutId = null;
+      }
+    };
+
+    // define startAnimation function to display the text in buffer smooth
+    // when you need to start the animation, call this function
+    const startAnimation = (speed = 2) =>
+      new Promise<void>((resolve) => {
+        if (isAnimationActive) {
+          resolve();
+          return;
+        }
+
+        isAnimationActive = true;
+
+        const updateText = () => {
+          // 如果动画已经不再激活，则停止更新文本
+          if (!isAnimationActive) {
+            clearTimeout(animationTimeoutId!);
+            animationTimeoutId = null;
+            resolve();
+          }
+
+          // 如果还有文本没有显示
+          // 检查队列中是否有字符待显示
+          if (outputQueue.length > 0) {
+            // 从队列中获取前两个字符（如果存在）
+            const charsToAdd = outputQueue.splice(0, speed).join('');
+            buffer += charsToAdd;
+
+            // 更新消息内容，这里可能需要结合实际情况调整
+            dispatchMessage({ id, key: 'content', type: 'updateMessage', value: buffer });
+
+            // 设置下一个字符的延迟
+            animationTimeoutId = setTimeout(updateText, 16); // 16 毫秒的延迟模拟打字机效果
+          } else {
+            // 当所有字符都显示完毕时，清除动画状态
+            isAnimationActive = false;
+            animationTimeoutId = null;
+            resolve();
+          }
+        };
+
+        updateText();
+      });
+
+    return { startAnimation, stopAnimation, outputQueue, isAnimationActive };
+  },
+
+  internalTraceMessage: async (id, payload) => {
+    // tracing the diff of update
+    const message = chatSelectors.getMessageById(id)(get());
+    if (!message) return;
+
+    const traceId = message?.traceId;
+    const observationId = message?.observationId;
+
+    if (traceId && message?.role === 'assistant') {
+      traceService
+        .traceEvent({ traceId, observationId, content: message.content, ...payload })
+        .catch();
     }
   },
 });

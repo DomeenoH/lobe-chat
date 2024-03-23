@@ -1,43 +1,24 @@
-import { BackBottom } from '@lobehub/ui';
 import { createStyles } from 'antd-style';
-import { ReactNode, memo, useRef } from 'react';
-import { useTranslation } from 'react-i18next';
+import { ReactNode, memo } from 'react';
 import { Flexbox } from 'react-layout-kit';
 
-import SafeSpacing from '@/components/SafeSpacing';
-import { useGlobalStore } from '@/store/global';
-import { settingsSelectors } from '@/store/global/selectors';
+import ChatHydration from '@/components/StoreHydration/ChatHydration';
 
-import ChatList from './ChatList';
-import ChatScrollAnchor from './ScrollAnchor';
-import { useInitConversation } from './useInitConversation';
+import SkeletonList from './components/SkeletonList';
+import ChatList from './components/VirtualizedList';
+import { useInitConversation } from './hooks/useInitConversation';
 
-const useStyles = createStyles(({ css, responsive, stylish, cx }, fontSize: number = 14) =>
-  cx(
-    css`
-      overflow: hidden scroll;
-      height: 100%;
+const useStyles = createStyles(
+  ({ css, responsive, stylish }) => css`
+    position: relative;
+    overflow-y: auto;
+    height: 100%;
 
-      ${responsive.mobile} {
-        ${stylish.noScrollbar}
-        width: 100vw;
-      }
-    `,
-    fontSize !== 14 &&
-      css`
-        article[data-code-type='markdown'] {
-          p,
-          code,
-          pre,
-          ul,
-          ol,
-          li,
-          blockquote {
-            font-size: ${fontSize}px;
-          }
-        }
-      `,
-  ),
+    ${responsive.mobile} {
+      ${stylish.noScrollbar}
+      width: 100vw;
+    }
+  `,
 );
 
 interface ConversationProps {
@@ -45,26 +26,22 @@ interface ConversationProps {
   mobile?: boolean;
 }
 
-const Conversation = memo<ConversationProps>(({ mobile, chatInput }) => {
-  const ref = useRef(null);
-  const { t } = useTranslation('chat');
-  const fontSize = useGlobalStore((s) => settingsSelectors.currentSettings(s).fontSize);
-  const { styles } = useStyles(fontSize);
+const Conversation = memo<ConversationProps>(({ chatInput, mobile }) => {
+  const { styles } = useStyles();
 
-  // init conversation
-  useInitConversation();
+  const init = useInitConversation();
 
   return (
-    <Flexbox flex={1} style={{ position: 'relative' }}>
-      <div style={{ flex: 1, overflow: 'hidden', position: 'relative' }}>
-        <div className={styles} ref={ref}>
-          {!mobile && <SafeSpacing />}
-          <ChatList />
-          <ChatScrollAnchor />
-        </div>
-        <BackBottom target={ref} text={t('backToBottom')} />
+    <Flexbox
+      flex={1}
+      //  position: 'relative' is required, ChatInput's absolute position needs it
+      style={{ position: 'relative' }}
+    >
+      <div className={styles}>
+        {init ? <ChatList mobile={mobile} /> : <SkeletonList mobile={mobile} />}
       </div>
       {chatInput}
+      <ChatHydration />
     </Flexbox>
   );
 });

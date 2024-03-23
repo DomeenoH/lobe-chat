@@ -14,8 +14,13 @@ export class MessageService {
   }
 
   async hasMessages() {
-    const isEmpty = await MessageModel.isEmpty();
-    return !isEmpty;
+    const number = await MessageModel.count();
+    return number > 0;
+  }
+
+  async messageCountToCheckTrace() {
+    const number = await MessageModel.count();
+    return number >= 4;
   }
 
   async getMessages(sessionId: string, topicId?: string): Promise<ChatMessage[]> {
@@ -53,8 +58,9 @@ export class MessageService {
   async updateMessagePlugin(id: string, plugin: ChatPluginPayload) {
     return MessageModel.update(id, { plugin });
   }
+
   async updateMessagePluginState(id: string, key: string, value: any) {
-    return MessageModel.update(id, { pluginState: { [key]: value } });
+    return MessageModel.updatePluginState(id, key, value);
   }
 
   async getAllMessages() {
